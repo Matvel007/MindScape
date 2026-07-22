@@ -5,6 +5,15 @@
 MindScape — open-source, local-first нативное Android-приложение для создания личной визуальной базы знаний.
 Создавайте связанные заметки и папки, добавляйте локальные файлы, просматривайте их на интерактивной карте, ищите по материалам и храните переносимые SQLAR-бэкапы на устройстве.
 
+## Скриншоты
+
+<p align="center">
+  <img src="screenshots/main.jpg" alt="Главный экран" width="200">
+  <img src="screenshots/map.jpg" alt="Карта знаний" width="200">
+  <img src="screenshots/files.jpg" alt="Экран файлов" width="200">
+  <img src="screenshots/structure.jpg" alt="Экран структуры" width="200">
+</p>
+
 ## Возможности
 
 - Интерактивная карта знаний в persistent WebView.
@@ -18,15 +27,6 @@ MindScape — open-source, local-first нативное Android-приложен
 ## Приватность
 
 MindScape работает по принципу local-first. Ваши заметки, файлы, настройки и бэкапы остаются на устройстве, если вы сами не экспортируете/не поделитесь ими или не отправите выбранные данные настроенному вами AI-провайдеру. В приложении нет отслеживающих компонентов, встроенного backend и API-ключей разработчика.
-
-## Скриншоты
-
-<p align="center">
-  <img src="screenshots/main.jpg" alt="Главный экран" width="200">
-  <img src="screenshots/map.jpg" alt="Карта знаний" width="200">
-  <img src="screenshots/files.jpg" alt="Экран файлов" width="200">
-  <img src="screenshots/structure.jpg" alt="Экран структуры" width="200">
-</p>
 
 ## Сборка
 
