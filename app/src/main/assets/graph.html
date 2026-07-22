@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>MindScape Graph</title>
+<script src="pixi.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0f1218; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<script>
+// ─── Global state ───
+let app, graphData = null, darkMode = true;
+let nodeSprites = {}, edgeGraphics = null, ticker = null;
+let dragTarget = null, viewport = { x: 0, y: 0, scale: 1 };
+let lastPinchDist = 0, pinching = false;
+let lastPinchTime = 0;
+let nodeClickCallback = null;
+let animTime = 0;
+let graphOptions = {
+  nodeSize: 1,
+  connectionDensity: 0.5,
+  connectionAnimation: true,
+  nodeGlow: true,
+  smoothZoom: true,
+  animationBoost: 1.2
+};
+
+// ─── Color palette for categories ───
+const PALETTE = [
+  0x4ea8ff, 0xff6b8a, 0x4ecb71, 0xf5a623, 0xb06fff,
+  0x00c9b8, 0xff8c42, 0x6fb3ff, 0xe8516a, 0x52d49a,
+  0xffbf47, 0x9b7cff, 0x29c9b8, 0xff7e5f, 0x5ca8ff,
+  0xf76b8a, 0x3dd98b, 0xffc547, 0xa77cff, 0x1acbbe
+];
+
+// ─── Bootstrap ───
+function startPixi() {
+  app = new PIXI.Application({
+    width: window.innerWidth,
+    height: window.innerHeight,
+    backgroundColor: darkMode ? 0x0f1218 : 0xf0f1ee,
+    antialias: true,
+    resolution: window.devicePixelRatio || 1,
+    autoDensity: true
+  });
+  document.body.appendChild(app.view);
+
+  // Resize handler
+  window.addEventListener("resize", () => {
+    app.renderer.resize(window.innerWidth, window.innerHeight);
+    if (graphData) renderGraph();
+  });
+
+  // Touch / mouse events for pan + pinch-zoom
+  app.view.addEventListener("touchstart", onTouchStart, { passive: false });
+  app.view.addEventListener("touchmove", onTouchMove, { passive: false });
+  app.view.addEventListener("touchend", onTouchEnd, { passive: false });
+  app.view.addEventListener("mousedown", onMouseDown);
+  app.view.addEventListener("mousemove", onMouseMove);
+  app.view.addEventListener("mouseup", onMouseUp);
+
+  // Animation loop
+  app.ticker.add(onTick);
+
+  // Tell Android we are ready
+  if (window.AndroidBridge) window.AndroidBridge.onReady();
+}
+
+let lastGraphJson = "";
+window.setGraphData = function(json) {
+  if (lastGraphJson === json) return;
+  lastGraphJson = json;
+  try {
+    graphData = JSON.parse(json);
+    if (app) renderGraph();
+  } catch(e) {}
+};
+
+let lastDarkMode = null;
+window.setDarkMode = function(dark) {
+  if (lastDarkMode === dark) return;
+  lastDarkMode = dark;
+  darkMode = !!dark;
+  if (app) {
+    app.renderer.backgroundColor = darkMode ? 0x0f1218 : 0xf0f1ee;
+    if (graphData) renderGraph();
+  }
+};
+
+window.setGraphOptions = function(options) {
+  graphOptions = Object.assign(graphOptions, options || {});
+  if (app && graphData) renderGraph();
+};
+
+window.centerRoot = function() {
+  viewport.x = 0; viewport.y = 0; viewport.scale = 1;
+  applyViewport();
+};
+
+window.centerNode = function(id, keepScale) {
+  const world = app.stage._world;
+  if (!world || !app.stage._nodeContainers) return;
+  const nc = app.stage._nodeContainers[id];
+  if (!nc) return;
+  app.stage._selectedNodeId = id;
+  if (!keepScale) viewport.scale = 1.5;
+  viewport.x = -nc.x * viewport.scale;
+  viewport.y = -nc.y * viewport.scale;
+  updateSelection();
+  applyViewport();
+};
+
+// Зум от центра экрана: сохраняем мировую точку под центром экрана неподвижной.
+window.zoomIn = function() { zoomAtScreenCenter(Math.min(viewport.scale * 1.25, 6)); };
+window.zoomOut = function() { zoomAtScreenCenter(Math.max(viewport.scale / 1.25, 0.12)); };
+window.resetView = function() { window.centerMainCenter(); };
+
+function zoomAtScreenCenter(newScale) {
+  const oldScale = viewport.scale;
+  if (newScale === oldScale) return;
+  // Мировая точка под центром экрана остаётся на месте: viewport.x *= newScale/oldScale
+  const k = newScale / oldScale;
+  viewport.x *= k;
+  viewport.y *= k;
+  viewport.scale = newScale;
+  applyViewport();
+}
+
+// Центрирование на главном центре или на общем центре расправленной карты.
+// Используется при каждом входе на вкладку «Карта».
+window.centerMainCenter = function() {
+  const bounds = getGraphBounds();
+  if (!bounds) {
+    viewport.x = 0; viewport.y = 0; viewport.scale = 1;
+    applyViewport();
+    return;
+  }
+  const W = app.screen.width, H = app.screen.height;
+  const scaleX = W / Math.max(1, bounds.width + 180);
+  const scaleY = H / Math.max(1, bounds.height + 260);
+  viewport.scale = Math.max(0.22, Math.min(1.5, Math.min(scaleX, scaleY)));
+  viewport.x = -bounds.cx * viewport.scale;
+  viewport.y = -bounds.cy * viewport.scale;
+  applyViewport();
+};
+
+// Центрирование мини-карты на главном центре с уменьшенным масштабом.
+window.centerMiniMap = function() {
+  const bounds = getGraphBounds();
+  viewport.scale = 0.42;
+  if (bounds) {
+    viewport.x = -bounds.cx * viewport.scale;
+    viewport.y = -bounds.cy * viewport.scale;
+  } else {
+    viewport.x = 0; viewport.y = 0;
+  }
+  applyViewport();
+};
+
+// ─── Graph rendering ───
+function renderGraph() {
+  app.stage.removeChildren();
+  nodeSprites = {};
+  animTime = 0;
+
+  const W = app.screen.width, H = app.screen.height;
+  const nodes = graphData.nodes || [];
+  const edges = graphData.edges || [];
+
+  // Assign colors to category groups
+  const groupColors = {};
+  let colorIdx = 0;
+  for (const n of nodes) {
+    if (n.group && !(n.group in groupColors)) {
+      groupColors[n.group] = PALETTE[colorIdx % PALETTE.length];
+      colorIdx++;
+    }
+  }
+
+  applyForceLayout(nodes, edges);
+
+  // Background stars
+  const rng = mulberry32(42);
+  const stars = [];
+  for (let i = 0; i < 280; i++) {
+    const sx = rng() * W * 3 - W;
+    const sy = rng() * H * 3 - H;
+    const r  = 0.8 + rng() * 1.8;
+    const a  = 0.3 + rng() * 0.5;
+    const c  = darkMode ? 0x8bb8ff : 0x6080c0;
+    const starGfx = new PIXI.Graphics();
+    starGfx.beginFill(c, a);
+    starGfx.drawCircle(0, 0, r);
+    starGfx.endFill();
+    starGfx.x = sx;
+    starGfx.y = sy;
+    starGfx.alpha = a;
+    starGfx._baseAlpha = a;
+    starGfx._twinklePhase = rng() * Math.PI * 2;
+    starGfx._twinkleSpeed = 0.35 + rng() * 0.7;
+    stars.push(starGfx);
+    app.stage.addChild(starGfx);
+  }
+  app.stage._stars = stars;
+
+  // Viewport container
+  const world = new PIXI.Container();
+  app.stage.addChild(world);
+  world._isWorld = true;
+
+  // Cloud halos for top-level nodes
+  const haloGfx = new PIXI.Graphics();
+  world.addChild(haloGfx);
+  for (const n of nodes) {
+    if (n.level === 0) {
+      const col = groupColors[n.group] || 0x4ea8ff;
+      const r   = 90;
+      const gr  = new PIXI.Graphics();
+      gr.beginFill(col, 0.07);
+      gr.drawCircle(n.x, n.y, r);
+      gr.endFill();
+      gr.beginFill(col, 0.04);
+      gr.drawCircle(n.x, n.y, r * 1.6);
+      gr.endFill();
+      world.addChild(gr);
+    }
+  }
+
+  // Edges container (drawn below nodes)
+  const edgeGfx = new PIXI.Graphics();
+  world.addChild(edgeGfx);
+
+  // Store references for animation
+  const edgeData = [];
+  for (const e of edges) {
+    const src = nodes.find(n => n.id === e.source) || nodes.find(n => n.title === e.source);
+    const tgt = nodes.find(n => n.id === e.target) || nodes.find(n => n.title === e.target);
+    if (src && tgt && !src.hidden && !tgt.hidden) edgeData.push({ src, tgt });
+  }
+
+  // Node containers
+  const nodeContainers = {};
+  for (const n of nodes) {
+    // Skip hidden nodes
+    if (n.hidden) continue;
+
+    const isFile = n.type === "file" || n.level === 4;
+    const col = isFile ? fileColor(n.mimeType || "") : (n.level === -1 ? (darkMode ? 0xffffff : 0x4a5b7c) : (groupColors[n.group] || PALETTE[0]));
+    const isRoot = n.level === -1;
+    const depth = n.depth || n.level; // depth from Java, fallback to level
+
+    const nc = new PIXI.Container();
+    nc.x = n.x; nc.y = n.y;
+    nc._nodeData = n;
+    nc._baseX = n.x; nc._baseY = n.y;
+    nc._bobPhase = Math.random() * Math.PI * 2;
+    nc._bobAmp = (isRoot ? 1.8 : 3.0 + Math.random() * 2.4) * graphOptions.animationBoost;
+    nc._bobSpeed = (0.6 + Math.random() * 0.4) * graphOptions.animationBoost;
+
+    // Size hierarchy: root(28) > level1 category(20) > level2 sub(14) > deeper sub(10) > note(7)
+    let circleR;
+    if (isRoot)         circleR = 28;
+    else if (isFile)    circleR = 9;
+    else if (n.level === 1 && depth <= 1) circleR = 20;
+    else if (n.level === 1)               circleR = 14;
+    else if (n.level === 2)               circleR = Math.max(8, 14 - (depth - 2) * 2);
+    else                                  circleR = 7;  // notes (level 3)
+    circleR *= Math.max(0.55, Math.min(1.8, graphOptions.nodeSize || 1));
+
+    // Glow
+    const glow = new PIXI.Graphics();
+    glow.beginFill(col, graphOptions.nodeGlow ? (isRoot ? 0.26 : 0.18) : 0.0);
+    glow.drawCircle(0, 0, circleR * 2);
+    glow.endFill();
+    nc.addChild(glow);
+
+    // Circle/file body
+    const circle = new PIXI.Graphics();
+    circle.lineStyle(isRoot ? 3 : 1.5, darkMode ? 0x1e2433 : 0xffffff, 1);
+    circle.beginFill(col, isRoot ? 1.0 : 0.88);
+    if (isFile) {
+      circle.drawRoundedRect(-circleR, -circleR - 2, circleR * 1.8, circleR * 2.2, 3);
+      circle.endFill();
+      circle.lineStyle(1, darkMode ? 0x1e2433 : 0xffffff, 0.7);
+      circle.moveTo(circleR * 0.2, -circleR - 2);
+      circle.lineTo(circleR * 0.8, -circleR * 0.35);
+      circle.lineTo(circleR * 0.2, -circleR * 0.35);
+      circle.lineTo(circleR * 0.2, -circleR - 2);
+      if (isImageNode(n)) drawImageFileGlyph(circle, circleR, darkMode ? 0x123344 : 0xffffff);
+    } else {
+      circle.drawCircle(0, 0, circleR);
+      circle.endFill();
+    }
+    nc.addChild(circle);
+    nc._circle = circle;
+    nc._circleR = circleR;
+    nc._col = col;
+
+    const selection = new PIXI.Graphics();
+    selection.visible = false;
+    nc.addChild(selection);
+    nc._selection = selection;
+
+    // Label font size scales with node size
+    const fontSize = isRoot ? 11 : (circleR >= 18 ? 10 : (circleR >= 12 ? 9 : 8));
+    const label = new PIXI.Text(n.title, {
+      fontFamily: "sans-serif",
+      fontSize,
+      fill: darkMode ? 0xe8eeff : 0x252d3c,
+      fontWeight: isRoot || n.level === 1 ? "bold" : "normal",
+      align: "center",
+      wordWrap: true,
+      wordWrapWidth: 80,
+      dropShadow: darkMode,
+      dropShadowColor: 0x000000,
+      dropShadowDistance: 1,
+      dropShadowAlpha: 0.6
+    });
+    label.anchor.set(0.5, 0);
+    label.y = circleR + 4;
+    nc.addChild(label);
+    nc._label = label;
+
+    // Hit area & click
+    nc.interactive = true;
+    nc.cursor = "pointer";
+    nc.hitArea = new PIXI.Circle(0, 0, circleR + 10);
+    
+    let downX = 0, downY = 0, downTime = 0;
+    nc.on("pointerdown", (e) => {
+      downX = e.data.global.x;
+      downY = e.data.global.y;
+      downTime = Date.now();
+    });
+    nc.on("pointerup", (e) => {
+      const dx = e.data.global.x - downX;
+      const dy = e.data.global.y - downY;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      const timeDiff = Date.now() - downTime;
+      const pinchTimeDiff = Date.now() - lastPinchTime;
+      console.log(`[Graph Touch] pointerup on '${n.title}': dist=${dist.toFixed(1)}, time=${timeDiff}ms, timeSincePinch=${pinchTimeDiff}ms`);
+      
+      if (dist < 10 && timeDiff < 500 && pinchTimeDiff > 500) {
+        if (window.AndroidBridge) window.AndroidBridge.onNodeClick(n.id || n.title);
+      }
+    });
+
+    world.addChild(nc);
+    nodeContainers[n.id || n.title] = nc;
+  }
+
+  // Store for tick
+  app.stage._world = world;
+  app.stage._edgeGfx = edgeGfx;
+  app.stage._edgeData = edgeData;
+  app.stage._nodeContainers = nodeContainers;
+  app.stage._nodes = nodes;
+  updateSelection();
+
+  // Keep current viewport stable across re-renders; explicit tab opening calls centerMainCenter().
+  applyViewport();
+}
+
+function isImageNode(n) {
+  const mime = String(n.mimeType || "").toLowerCase();
+  const title = String(n.fileTitle || n.title || "").toLowerCase();
+  return mime.startsWith("image/") || /\.(jpg|jpeg|png|webp|gif|bmp|heic|heif|svg)$/.test(title);
+}
+
+function drawImageFileGlyph(g, r, color) {
+  g.lineStyle(1.1, color, 0.9);
+  const left = -r * 0.58, bottom = r * 0.62;
+  g.moveTo(left, bottom);
+  g.lineTo(-r * 0.22, r * 0.18);
+  g.lineTo(r * 0.04, r * 0.44);
+  g.lineTo(r * 0.38, -r * 0.04);
+  g.lineTo(r * 0.62, r * 0.62);
+  g.moveTo(r * 0.28, -r * 0.5);
+  g.drawCircle(r * 0.28, -r * 0.5, Math.max(1.2, r * 0.12));
+}
+
+function updateSelection() {
+  const nodeContainers = app && app.stage._nodeContainers;
+  if (!nodeContainers) return;
+  const selected = app.stage._selectedNodeId;
+  for (const key of Object.keys(nodeContainers)) {
+    const nc = nodeContainers[key];
+    if (!nc._selection) continue;
+    const active = key === selected;
+    nc._selection.visible = active;
+    nc._selection.clear();
+    if (active) {
+      nc._selection.lineStyle(2.5, darkMode ? 0xb8d4ff : 0x306fe0, 0.95);
+      nc._selection.drawCircle(0, 0, nc._circleR + 8);
+      nc._selection.lineStyle(1, darkMode ? 0x7aaeff : 0x6a9bff, 0.45);
+      nc._selection.drawCircle(0, 0, nc._circleR + 14);
+    }
+  }
+}
+
+function applyForceLayout(nodes, edges) {
+  const visibleNodes = nodes.filter(n => !n.hidden);
+  if (visibleNodes.length <= 1) return;
+
+  const byId = {};
+  for (const n of visibleNodes) {
+    const key = n.id || n.title;
+    byId[key] = n;
+    if (!Number.isFinite(n.x)) n.x = 0;
+    if (!Number.isFinite(n.y)) n.y = 0;
+    n._seedX = n.x;
+    n._seedY = n.y;
+    const jitter = hashUnit(key) * 20;
+    n.x += Math.cos(jitter) * 4;
+    n.y += Math.sin(jitter) * 4;
+    n.vx = 0;
+    n.vy = 0;
+    n._r = collisionRadius(n);
+  }
+
+  const links = [];
+  for (const e of edges) {
+    const src = byId[e.source] || visibleNodes.find(n => n.title === e.source);
+    const tgt = byId[e.target] || visibleNodes.find(n => n.title === e.target);
+    if (src && tgt) links.push({ src, tgt, length: linkLength(src, tgt), strength: linkStrength(src, tgt) });
+  }
+
+  const iterations = Math.min(420, Math.max(220, visibleNodes.length * 5));
+  for (let step = 0; step < iterations; step++) {
+    const alpha = 1 - step / iterations;
+
+    for (const link of links) {
+      const dx = link.tgt.x - link.src.x;
+      const dy = link.tgt.y - link.src.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 0.001;
+      const force = (dist - link.length) * link.strength * alpha;
+      const fx = dx / dist * force;
+      const fy = dy / dist * force;
+      const srcMass = nodeMass(link.src);
+      const tgtMass = nodeMass(link.tgt);
+      link.src.vx += fx / srcMass;
+      link.src.vy += fy / srcMass;
+      link.tgt.vx -= fx / tgtMass;
+      link.tgt.vy -= fy / tgtMass;
+
+      const out = outwardDirection(link.src, link.tgt);
+      const dot = (dx / dist) * out.x + (dy / dist) * out.y;
+      const outwardForce = Math.max(0, 1 - dot) * link.strength * 34 * alpha;
+      link.tgt.vx += out.x * outwardForce / tgtMass;
+      link.tgt.vy += out.y * outwardForce / tgtMass;
+    }
+
+    for (let i = 0; i < visibleNodes.length; i++) {
+      const a = visibleNodes[i];
+      for (let j = i + 1; j < visibleNodes.length; j++) {
+        const b = visibleNodes[j];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let distSq = dx * dx + dy * dy;
+        if (distSq < 0.01) {
+          const seed = hashUnit((a.id || a.title) + "|" + (b.id || b.title));
+          dx = Math.cos(seed * Math.PI) * 0.1;
+          dy = Math.sin(seed * Math.PI) * 0.1;
+          distSq = dx * dx + dy * dy;
+        }
+        const dist = Math.sqrt(distSq);
+        const minDist = a._r + b._r;
+        const repel = Math.min(4.6, 5200 / Math.max(1600, distSq));
+        let push = repel * alpha;
+        if (dist < minDist) {
+          push += (minDist - dist) * 0.18;
+        }
+        const fx = dx / dist * push;
+        const fy = dy / dist * push;
+        const am = nodeMass(a);
+        const bm = nodeMass(b);
+        a.vx -= fx / am;
+        a.vy -= fy / am;
+        b.vx += fx / bm;
+        b.vy += fy / bm;
+      }
+    }
+
+    for (const n of visibleNodes) {
+      const centerStrength = n.level === -1 ? 0.004 : 0.0008;
+      n.vx += -n.x * centerStrength * alpha;
+      n.vy += -n.y * centerStrength * alpha;
+
+      n.vx *= 0.82;
+      n.vy *= 0.82;
+      n.x += n.vx;
+      n.y += n.vy;
+    }
+  }
+
+  for (const n of visibleNodes) {
+    delete n.vx;
+    delete n.vy;
+  }
+}
+
+function outwardDirection(src, tgt) {
+  let dx = (tgt._seedX || 0) - (src._seedX || 0);
+  let dy = (tgt._seedY || 0) - (src._seedY || 0);
+  let len = Math.sqrt(dx * dx + dy * dy);
+  if (len < 0.001) {
+    dx = src._seedX || src.x || 1;
+    dy = src._seedY || src.y || 0;
+    len = Math.sqrt(dx * dx + dy * dy) || 1;
+  }
+  return { x: dx / len, y: dy / len };
+}
+
+function collisionRadius(n) {
+  if (n.level === -1) return 110;
+  const depth = n.depth || n.level || 1;
+  if (n.level === 1 && depth <= 1) return 82;
+  if (n.level === 1) return 68;
+  if (n.level === 2) return 52;
+  return 40;
+}
+
+function nodeMass(n) {
+  if (n.level === -1) return 4.5;
+  if (n.level === 1) return 2.2;
+  if (n.level === 2) return 1.5;
+  return 1.0;
+}
+
+function linkLength(a, b) {
+  const hierarchy = (a.id || "").startsWith("folder:") && (b.id || "").startsWith("folder:");
+  const hasRoot = a.level === -1 || b.level === -1;
+  const hasNote = a.level === 3 || b.level === 3;
+  if (hasRoot) return 210;
+  if (hasNote) return 98;
+  if (hierarchy) return 165;
+  return 260;
+}
+
+function linkStrength(a, b) {
+  const sameGroup = a.group && b.group && a.group === b.group;
+  if (a.level === -1 || b.level === -1) return 0.035;
+  return sameGroup ? 0.045 : 0.012;
+}
+
+function fileColor(mime) {
+  const m = String(mime || "").toLowerCase();
+  if (m.includes("pdf")) return 0xe8516a;
+  if (m.includes("word") || m.includes("msword")) return 0x4ea8ff;
+  if (m.includes("spreadsheet") || m.includes("excel") || m.includes("csv")) return 0x4ecb71;
+  if (m.includes("presentation") || m.includes("powerpoint")) return 0xf5a623;
+  if (m.startsWith("image/")) return 0x00c9b8;
+  return 0x6fb3ff;
+}
+
+function getGraphBounds() {
+  const nodes = app && app.stage._nodes;
+  if (!nodes || nodes.length === 0) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  let found = false;
+  for (const n of nodes) {
+    if (n.hidden) continue;
+    found = true;
+    const r = n._r || collisionRadius(n);
+    minX = Math.min(minX, n.x - r);
+    minY = Math.min(minY, n.y - r);
+    maxX = Math.max(maxX, n.x + r);
+    maxY = Math.max(maxY, n.y + r);
+  }
+  if (!found) return null;
+  return {
+    minX, minY, maxX, maxY,
+    width: maxX - minX,
+    height: maxY - minY,
+    cx: (minX + maxX) / 2,
+    cy: (minY + maxY) / 2
+  };
+}
+
+// ─── Animation tick ───
+function onTick(delta) {
+  animTime += delta * 0.016; // ~seconds
+  const world = app.stage._world;
+  const edgeGfx = app.stage._edgeGfx;
+  const edgeData = app.stage._edgeData;
+  const nodeContainers = app.stage._nodeContainers;
+  const stars = app.stage._stars || [];
+  if (!world || !edgeData) return;
+
+  for (let i = 0; i < stars.length; i++) {
+    const s = stars[i];
+    const pulse = 0.72 + Math.sin(animTime * s._twinkleSpeed + s._twinklePhase) * 0.28;
+    s.alpha = Math.max(0.12, Math.min(1, s._baseAlpha * pulse));
+  }
+
+  // Positions are fixed (deterministic layout from Java) — no force-directed reshuffle.
+  // Only a gentle visual "bob" keeps the map feeling alive; positions are stable across launches.
+  const keys = Object.keys(nodeContainers);
+  for (let i = 0; i < keys.length; i++) {
+    const nc = nodeContainers[keys[i]];
+    const t = animTime * nc._bobSpeed + nc._bobPhase;
+    nc.x = nc._baseX + Math.sin(t) * nc._bobAmp;
+    nc.y = nc._baseY + Math.cos(t * 0.7) * nc._bobAmp * 0.6;
+  }
+
+  // Animate edges (shimmering flow effect)
+  edgeGfx.clear();
+  for (const e of edgeData) {
+    const srcKey = e.src.id || e.src.title;
+    const tgtKey = e.tgt.id || e.tgt.title;
+    const srcCont = nodeContainers[srcKey];
+    const tgtCont = nodeContainers[tgtKey];
+    if (!srcCont || !tgtCont) continue;
+
+    const sx = srcCont.x, sy = srcCont.y;
+    const ex = tgtCont.x, ey = tgtCont.y;
+
+    // Phase shift gives flowing shimmer
+    const phase = (animTime * 1.2 + srcCont._bobPhase) % (Math.PI * 2);
+    const alpha = 0.28 + graphOptions.connectionDensity * 0.34 + (graphOptions.connectionAnimation ? Math.sin(phase) * 0.12 : 0);
+    const width = 1.1 + graphOptions.connectionDensity * 0.9 + (graphOptions.connectionAnimation ? Math.sin(phase + 1) * 0.35 : 0);
+
+    const baseColor = darkMode ? 0x72a6ff : 0x356fc8;
+    edgeGfx.lineStyle(width, baseColor, Math.min(0.92, alpha));
+    edgeGfx.moveTo(sx, sy);
+    edgeGfx.lineTo(ex, ey);
+  }
+}
+
+// ─── Viewport ───
+function applyViewport() {
+  const world = app && app.stage._world;
+  if (!world) return;
+  const W = app.screen.width, H = app.screen.height;
+  world.x = W / 2 + viewport.x;
+  world.y = H / 2 + viewport.y;
+  world.scale.set(viewport.scale);
+}
+
+// ─── Touch events ───
+let touchStart = {}, touchStartVp = {};
+let lastTapTime = 0;
+let lastTouchX = 0, lastTouchY = 0;
+
+function onTouchStart(e) {
+  e.preventDefault();
+  if (e.touches.length === 1) {
+    lastTouchX = e.touches[0].clientX;
+    lastTouchY = e.touches[0].clientY;
+    pinching = false;
+  } else if (e.touches.length === 2) {
+    pinching = true;
+    lastPinchDist = dist2Touches(e.touches);
+    lastTouchX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+    lastTouchY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+  }
+}
+
+function onTouchMove(e) {
+  e.preventDefault();
+  lastTapTime = 0; // Cancel tap if moving
+  if (e.touches.length === 2) {
+    pinching = true;
+    lastPinchTime = Date.now();
+    const d = dist2Touches(e.touches);
+    const scale = d / lastPinchDist;
+    const oldScale = viewport.scale;
+    viewport.scale = Math.max(0.1, Math.min(6, viewport.scale * scale));
+    const f = viewport.scale / oldScale;
+    lastPinchDist = d;
+    const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+    const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    const W = app.screen.width, H = app.screen.height;
+    
+    // zoom towards pinch center
+    viewport.x -= (mx - W/2 - viewport.x) * (f - 1);
+    viewport.y -= (my - H/2 - viewport.y) * (f - 1);
+    
+    // pan offset
+    viewport.x += mx - lastTouchX;
+    viewport.y += my - lastTouchY;
+    
+    lastTouchX = mx; lastTouchY = my;
+    applyViewport();
+  } else if (e.touches.length === 1 && !pinching) {
+    const dx = e.touches[0].clientX - lastTouchX;
+    const dy = e.touches[0].clientY - lastTouchY;
+    viewport.x += dx; viewport.y += dy;
+    lastTouchX = e.touches[0].clientX;
+    lastTouchY = e.touches[0].clientY;
+    applyViewport();
+  }
+}
+
+function onTouchEnd(e) {
+  e.preventDefault();
+  if (e.touches.length < 2) pinching = false;
+  if (e.touches.length === 1) {
+    lastTouchX = e.touches[0].clientX;
+    lastTouchY = e.touches[0].clientY;
+  }
+  // Double tap to zoom (only if no recent pinch)
+  const now = Date.now();
+  if (now - lastPinchTime > 500) {
+    if (lastTapTime > 0 && now - lastTapTime < 300) {
+      zoomAtScreenCenter(Math.min(viewport.scale * 1.6, 6));
+      lastTapTime = 0;
+    } else {
+      lastTapTime = now;
+    }
+  } else {
+    lastTapTime = 0;
+  }
+}
+
+// Mouse drag
+let mouseDown = false, mouseLX = 0, mouseLY = 0;
+function onMouseDown(e) { mouseDown = true; mouseLX = e.clientX; mouseLY = e.clientY; }
+function onMouseMove(e) {
+  if (!mouseDown) return;
+  viewport.x += e.clientX - mouseLX;
+  viewport.y += e.clientY - mouseLY;
+  mouseLX = e.clientX; mouseLY = e.clientY;
+  applyViewport();
+}
+function onMouseUp() { mouseDown = false; }
+
+// ─── Utils ───
+function dist2Touches(touches) {
+  const dx = touches[0].clientX - touches[1].clientX;
+  const dy = touches[0].clientY - touches[1].clientY;
+  return Math.sqrt(dx*dx + dy*dy);
+}
+
+function mulberry32(seed) {
+  return function() {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function hashUnit(value) {
+  let h = 2166136261;
+  const str = String(value || "");
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return ((h >>> 0) / 4294967295) * 2 - 1;
+}
+
+// ─── Start immediately (PixiJS is bundled locally) ───
+startPixi();
+</script>
+</body>
+</html>
