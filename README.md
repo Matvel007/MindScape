@@ -21,10 +21,12 @@ MindScape is local-first. Your notes, files, settings, and backups stay on your 
 
 ## Screenshots
 
-<img src="screenshots/main.jpg" alt="Main screen" width="220">
-<img src="screenshots/map.jpg" alt="Knowledge map" width="220">
-<img src="screenshots/files.jpg" alt="Files screen" width="220">
-<img src="screenshots/structure.jpg" alt="Structure screen" width="220">
+<p align="center">
+  <img src="screenshots/main.jpg" alt="Main screen" width="200">
+  <img src="screenshots/map.jpg" alt="Knowledge map" width="200">
+  <img src="screenshots/files.jpg" alt="Files screen" width="200">
+  <img src="screenshots/structure.jpg" alt="Structure screen" width="200">
+</p>
 
 ## Build
 
